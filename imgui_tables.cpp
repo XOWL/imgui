@@ -685,7 +685,7 @@ void ImGui::TableUpdateLayout(ImGuiTable* table)
 
         // Adjust flags: default width mode + weighted columns are not allowed when auto extending
         // FIXME-TABLE: Clarify why we need to do this again here and not just in TableSetupColumn()
-        column->Flags = TableFixColumnFlags(table, column->FlagsIn);
+        column->Flags = TableFixColumnFlags(table, column->FlagsIn) | (column->Flags & ImGuiTableColumnFlags_StatusMask_);
         if ((column->Flags & ImGuiTableColumnFlags_IndentMask_) == 0)
             column->Flags |= (column_n == 0) ? ImGuiTableColumnFlags_IndentEnable : ImGuiTableColumnFlags_IndentDisable;
         if ((column->Flags & ImGuiTableColumnFlags_NoResize) == 0)
@@ -851,6 +851,9 @@ void ImGui::TableUpdateLayout(ImGuiTable* table)
         if (table->FreezeColumnsCount > 0 && table->FreezeColumnsCount == visible_n)
             offset_x += work_rect.Min.x - table->OuterRect.Min.x;
 
+        // Clear status flags
+        column->Flags &= ~ImGuiTableColumnFlags_StatusMask_;
+
         if ((table->EnabledMaskByDisplayOrder & ((ImU64)1 << order_n)) == 0)
         {
             // Hidden column: clear a few fields and we are done with it for the remainder of the function.
@@ -865,6 +868,10 @@ void ImGui::TableUpdateLayout(ImGuiTable* table)
             column->ItemWidth = 1.0f;
             continue;
         }
+
+        // Detect hovered column
+        if (is_hovering_table && g.IO.MousePos.x >= column->ClipRect.Min.x && g.IO.MousePos.x < column->ClipRect.Max.x)
+            table->HoveredColumnBody = (ImGuiTableColumnIdx)column_n;
 
         // Maximum width
         float max_width = FLT_MAX;
@@ -936,9 +943,14 @@ void ImGui::TableUpdateLayout(ImGuiTable* table)
         if (column->IsSkipItems)
             IM_ASSERT(!is_visible);
 
-        // Detect hovered column
-        if (is_hovering_table && g.IO.MousePos.x >= column->ClipRect.Min.x && g.IO.MousePos.x < column->ClipRect.Max.x)
-            table->HoveredColumnBody = (ImGuiTableColumnIdx)column_n;
+        // Update status flags
+        column->Flags |= ImGuiTableColumnFlags_IsEnabled;
+        if (is_visible)
+            column->Flags |= ImGuiTableColumnFlags_IsVisible;
+        if (column->SortOrder != -1)
+            column->Flags |= ImGuiTableColumnFlags_IsSorted;
+        if (table->HoveredColumnBody == column_n)
+            column->Flags |= ImGuiTableColumnFlags_IsHovered;
 
         // Alignment
         // FIXME-TABLE: This align based on the whole column width, not per-cell, and therefore isn't useful in
@@ -1237,6 +1249,7 @@ static void TableUpdateColumnsWeightFromWidth(ImGuiTable* table)
         ImGuiTableColumn* column = &table->Columns[column_n];
         if (!column->IsEnabled || !(column->Flags & ImGuiTableColumnFlags_WidthStretch))
             continue;
+        IM_ASSERT(column->StretchWeight > 0.0f);
         visible_weight += column->StretchWeight;
         visible_width += column->WidthRequest;
     }
@@ -1355,6 +1368,7 @@ void ImGui::TableSetupColumn(const char* label, ImGuiTableColumnFlags flags, flo
     IM_ASSERT(table != NULL && "Need to call TableSetupColumn() after BeginTable()!");
     IM_ASSERT(table->IsLayoutLocked == false && "Need to call call TableSetupColumn() before first row!");
     IM_ASSERT(table->DeclColumnsCount >= 0 && table->DeclColumnsCount < table->ColumnsCount && "Called TableSetupColumn() too many times!");
+    IM_ASSERT((flags & ImGuiTableColumnFlags_StatusMask_) == 0 && "Illegal to pass StatusMask values to TableSetupColumn()");
 
     ImGuiTableColumn* column = &table->Columns[table->DeclColumnsCount];
     table->DeclColumnsCount++;
@@ -1368,7 +1382,7 @@ void ImGui::TableSetupColumn(const char* label, ImGuiTableColumnFlags flags, flo
 
     column->UserID = user_id;
     column->FlagsIn = flags;
-    column->Flags = TableFixColumnFlags(table, column->FlagsIn);
+    column->Flags = TableFixColumnFlags(table, column->FlagsIn) | (column->Flags & ImGuiTableColumnFlags_StatusMask_);
     flags = column->Flags;
 
     // Initialize defaults
@@ -1747,15 +1761,15 @@ const char* ImGui::TableGetColumnName(int column_n)
     return TableGetColumnName(table, column_n);
 }
 
-bool ImGui::TableGetColumnIsEnabled(int column_n)
+ImGuiTableColumnFlags ImGui::TableGetColumnFlags(int column_n)
 {
     ImGuiContext& g = *GImGui;
     ImGuiTable* table = g.CurrentTable;
     if (!table)
-        return false;
+        return ImGuiTableColumnFlags_None;
     if (column_n < 0)
         column_n = table->CurrentColumn;
-    return (table->EnabledMaskByIndex & ((ImU64)1 << column_n)) != 0;
+    return table->Columns[column_n].Flags;
 }
 
 void ImGui::TableSetColumnIsEnabled(int column_n, bool hidden)
@@ -2272,7 +2286,6 @@ void ImGui::TableDrawBorders(ImGuiTable* table)
 // [SECTION] Tables: Sorting
 //-------------------------------------------------------------------------
 // - TableGetSortSpecs()
-// - TableGetColumnIsSorted()
 // - TableFixColumnSortDirection() [Internal]
 // - TableSetColumnSortDirection() [Internal]
 // - TableSortSpecsSanitize() [Internal]
@@ -2300,18 +2313,6 @@ ImGuiTableSortSpecs* ImGui::TableGetSortSpecs()
         TableSortSpecsBuild(table);
 
     return table->SortSpecs.SpecsCount ? &table->SortSpecs : NULL;
-}
-
-bool ImGui::TableGetColumnIsSorted(int column_n)
-{
-    ImGuiContext& g = *GImGui;
-    ImGuiTable* table = g.CurrentTable;
-    if (!table)
-        return false;
-    if (column_n < 0)
-        column_n = table->CurrentColumn;
-    ImGuiTableColumn* column = &table->Columns[column_n];
-    return (column->SortOrder != -1);
 }
 
 void ImGui::TableFixColumnSortDirection(ImGuiTableColumn* column)
@@ -2469,7 +2470,7 @@ float ImGui::TableGetHeaderRowHeight()
     float row_height = GetTextLineHeight();
     int columns_count = TableGetColumnCount();
     for (int column_n = 0; column_n < columns_count; column_n++)
-        if (TableGetColumnIsEnabled(column_n))
+        if (TableGetColumnFlags(column_n) & ImGuiTableColumnFlags_IsEnabled)
             row_height = ImMax(row_height, CalcTextSize(TableGetColumnName(column_n)).y);
     row_height += GetStyle().CellPadding.y * 2.0f;
     return row_height;
